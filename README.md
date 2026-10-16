@@ -35,7 +35,7 @@ Basic Auth via a secret manager. There are no default credentials. This adapter 
 indexes, ingest documents, manage mappings, or retry searches. Validate server permissions,
 version compatibility, and query mappings in the deployment environment before release.
 
-This pre-alpha package supports Python 3.11–3.14. The official client supports async/await and
+This alpha package supports Python 3.11–3.14. The official client supports async/await and
 requires explicit closure; the provider owns these lifecycle details. Current client compatibility
 is documented by Elastic: its 8.x Python client supports Elasticsearch 8.x and 9.x (not 10.x).
 The package suite passes on Python 3.11–3.14. Its local live integration check passed on Python 3.11

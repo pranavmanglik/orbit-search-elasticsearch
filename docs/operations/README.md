@@ -1,62 +1,50 @@
-# Orbit Elasticsearch: operations and security
+# Orbit Elasticsearch: operations
 
-This guide organizes runtime behavior documented by the package. It does not certify production readiness. Verify provider/client versions, permissions, transport security, limits, and failure behavior in the target environment before release.
-
-## Configuration surface
-
-Environment names found in the package README:
-
-- `ORBIT_ELASTICSEARCH_ALLOW_REMOTE_TESTS`
-- `ORBIT_ELASTICSEARCH_API_KEY`
-- `ORBIT_ELASTICSEARCH_CA_CERTS`
-- `ORBIT_ELASTICSEARCH_URL`
-
-Use the package README's constructor and deployment examples. Store credentials in a secret manager and avoid logging credentials, raw provider errors, request data, or opaque cursors.
-
-## Lifecycle, failure behavior, and limits
-
-`orbit-search-elasticsearch` is the optional Elasticsearch provider for the provider-neutral
-`orbit-search` capability. Install both explicitly:
+This package implements `orbit-search` using Elastic's asynchronous Python client. Install the
+capability and adapter extra explicitly:
 
 ```bash
 python -m pip install 'orbit-search' 'orbit-search-elasticsearch[elasticsearch]'
 ```
 
-```python
-from orbit_search_elasticsearch import ElasticsearchSearchStore
-from orbit_search import SearchQuery
+The README contains a complete construction and shutdown example. `ElasticsearchSearchStore.connect`
+accepts one or more hosts, an optional API key or Basic Auth tuple, an optional CA bundle, a cursor
+signing secret, and a request timeout. No credential is supplied by default. For injected clients,
+the store applies its timeout to search and point-in-time requests; the caller remains responsible
+for configuring TLS and authentication on that client.
 
-store = ElasticsearchSearchStore.connect(
-    ["https://search.example.internal:9200"],
-    api_key=api_key,  # load from a secret manager
-    ca_certs="/etc/ssl/certs/search-ca.pem",
-    cursor_secret=cursor_secret_from_secret_manager,
-)
-try:
-    page = await store.search("articles", SearchQuery(text="async", fields=("title",)))
-finally:
-    await store.aclose()
-```
+## Request and pagination behavior
 
-The adapter translates the portable text and exact-match filters into Elasticsearch Query DSL. It
-uses the official async client, PIT plus `search_after` for consistent bounded pagination, signs
-opaque cursors with the configured shared secret, limits pages to 100 hits, rejects partial/time-out results,
-sanitizes vendor failures, propagates cancellation, and drains active searches before closing its
-owned client. PITs expire after one minute; all workers serving a cursor must share the same high-entropy
-secret from a secret manager. Do not log cursors because they contain snapshot identifiers.
+Each search uses Elasticsearch `multi_match` over the requested fields and exact `term` filters. A
+`None` filter value is translated to a missing-field predicate. Callers must provide mappings with
+appropriate field types; this adapter does not manage mappings or reinterpret provider relevance.
+Partial shard responses and timed-out queries fail as retryable normalized errors rather than
+returning an incomplete page.
 
-TLS verification uses the SDK's secure defaults; configure credentials with API keys or explicit
-Basic Auth via a secret manager. There are no default credentials. This adapter does not provision
-indexes, ingest documents, manage mappings, or retry searches. Validate server permissions,
-version compatibility, and query mappings in the deployment environment before release.
+Pages use a point-in-time view and `search_after`. The PIT keep-alive is one minute. Continuation
+cursors contain the PIT identifier and sort values, authenticated with HMAC-SHA256, and bound to the
+index and query parameters. All workers that exchange cursors must use the same 32–64 byte secret.
+Rotate that secret only when existing cursors can be discarded. Treat cursors as sensitive: do not
+log or expose them in analytics, and expect them to expire with the PIT. Elasticsearch can rotate
+the PIT identifier in a search response; the adapter tracks the newest identifier for continuation
+and closes that latest snapshot on the final page or an error. PIT close failures are ignored because
+Elasticsearch expires snapshots server-side; close-point-in-time calls and searches are bounded by
+`request_timeout`. Before signing a continuation cursor, it validates the provider sort tuple as a
+finite score and non-negative shard ordinal; malformed pagination metadata fails the current search.
 
-This pre-alpha package supports Python 3.11–3.14. The official client supports async/await and
-requires explicit closure; the provider owns these lifecycle details. Current client compatibility
-is documented by Elastic: its 8.x Python client supports Elasticsearch 8.x and 9.x (not 10.x).
-The package suite passes on Python 3.11–3.14. Its local live integration check passed on Python 3.11
-against Elasticsearch 8.17.4 with `elasticsearch` 8.19.3; this does not establish production
-topology or a full server/client compatibility matrix.
+`aclose()` stops new searches, drains active operations, and closes the owned async client. Call it
+during application shutdown. Repeated calls after successful shutdown are safe. If client shutdown
+fails, a normalized retryable error is raised so cleanup can be retried.
 
-## Production validation
+## Live integration test
 
-Validate startup/shutdown cleanup, timeout and cancellation behavior, concurrency and payload bounds where applicable, secret rotation and least-privilege access, data durability, backup/restore, and failover against the selected provider. Do not infer distributed or durable guarantees from an in-process API or fake-client tests.
+The ordinary test suite uses a fake client. The opt-in live test creates a uniquely named index,
+indexes sample documents, checks filtered PIT pagination, and deletes that index. Set
+`ORBIT_ELASTICSEARCH_URL` to a disposable service. Remote endpoints require the explicit
+`ORBIT_ELASTICSEARCH_ALLOW_REMOTE_TESTS=1` opt-in. `ORBIT_ELASTICSEARCH_API_KEY` and
+`ORBIT_ELASTICSEARCH_CA_CERTS` are read by the live test from the process environment; never place
+secrets in shell history or committed files.
+
+Before deployment, validate the Elastic client/server version pair, least-privilege index access,
+TLS trust, query mappings, timeout behavior, secret rotation, and PIT pressure under realistic
+concurrency. Local fake-client checks do not certify these deployment properties.

@@ -37,7 +37,7 @@ Basic Auth via a secret manager. There are no default credentials. This adapter 
 indexes, ingest documents, manage mappings, or retry searches. Validate server permissions,
 version compatibility, and query mappings in the deployment environment before release.
 
-This pre-alpha package supports Python 3.11–3.14. The official client supports async/await and
+This alpha package supports Python 3.11–3.14. The official client supports async/await and
 requires explicit closure; the provider owns these lifecycle details. Current client compatibility
 is documented by Elastic: its 8.x Python client supports Elasticsearch 8.x and 9.x (not 10.x).
 The package suite passes on Python 3.11–3.14. Its local live integration check passed on Python 3.11
@@ -62,10 +62,28 @@ Representative implementation files in this checkout:
 - `src/orbit_search_elasticsearch/__init__.py`
 - `src/orbit_search_elasticsearch/store.py`
 
-## Public contract and scope
+## Contract mapping and ownership
 
-The README does not contain a separately headed architecture section. Its responsibility statement above and the public source files define the implemented scope; this guide adds no behavior beyond that description.
+The adapter implements `SearchStore.search(collection, query)` from `orbit-search`:
+
+1. It validates the collection alias and accepts only a `SearchQuery` value.
+2. It builds an Elasticsearch `multi_match` query and exact filters from the capability fields.
+3. It opens or resumes a one-minute point-in-time snapshot and requests at most one extra hit to
+   determine whether another bounded page exists.
+4. It validates every returned ID, score, source document, timing field, and pagination sort value
+   before constructing `SearchPage`.
+5. It translates expected provider failures into the capability's safe error types and closes PITs
+   when pagination is complete or a request fails.
+
+The adapter owns the async SDK client passed to its constructor. `aclose()` prevents new work, drains
+active searches, and closes that client. The capability contract itself does not define lifecycle
+methods; applications must retain and close the adapter instance during shutdown.
+
+The cursor format is adapter-private. It contains a PIT ID, the two sort values, and a SHA-256 query
+fingerprint, authenticated with HMAC-SHA256. It is not encrypted and should be treated as sensitive.
 
 ## Boundary rules
 
-Keep provider SDKs, credentials, transports, and provider-specific error translation in provider adapters. Keep reusable capability contracts in the matching capability package and lifecycle orchestration in Core. Apply the relevant layer for this repository and preserve the dependency direction shown above.
+Keep provider SDKs, credentials, transport behavior, PIT management, and Elasticsearch error
+translation in this adapter. Keep shared query values and errors in `orbit-search`. Do not add
+Elasticsearch DSL or SDK types to the capability package.

@@ -53,7 +53,24 @@ def _body(response: Any) -> Mapping[str, Any]:
 
 
 def _stable_json(value: object) -> bytes:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+    ).encode()
+
+
+def _valid_sort_values(value: object) -> bool:
+    """Accept only the finite score and non-negative shard ordinal used by this adapter."""
+    if not isinstance(value, list) or len(value) != 2:
+        return False
+    score, shard_ordinal = value
+    return (
+        isinstance(score, (int, float))
+        and not isinstance(score, bool)
+        and math.isfinite(score)
+        and isinstance(shard_ordinal, int)
+        and not isinstance(shard_ordinal, bool)
+        and shard_ordinal >= 0
+    )
 
 
 class ElasticsearchSearchStore:
@@ -61,6 +78,8 @@ class ElasticsearchSearchStore:
 
     The store owns the client passed to it and closes it from :meth:`aclose`. Cursors are bound
     to the configured secret so workers can share cursors, and expire with the one-minute PIT.
+    The timeout bounds each search and PIT request. Cursor secrets must be stable across workers
+    that exchange cursors and should be loaded from a secret manager.
     """
 
     def __init__(
@@ -70,7 +89,12 @@ class ElasticsearchSearchStore:
         cursor_secret: bytes,
         request_timeout: float = 10.0,
     ) -> None:
-        if not math.isfinite(request_timeout) or not 0.1 <= request_timeout <= 120:
+        if (
+            isinstance(request_timeout, bool)
+            or not isinstance(request_timeout, (int, float))
+            or not math.isfinite(request_timeout)
+            or not 0.1 <= request_timeout <= 120
+        ):
             raise ValueError("request_timeout must be between 0.1 and 120 seconds.")
         if not isinstance(cursor_secret, bytes) or not 32 <= len(cursor_secret) <= 64:
             raise ValueError("cursor_secret must contain 32 through 64 secret bytes.")
@@ -94,7 +118,13 @@ class ElasticsearchSearchStore:
         cursor_secret: bytes,
         request_timeout: float = 10.0,
     ) -> ElasticsearchSearchStore:
-        """Create and own an official async client; configure TLS/auth explicitly as needed."""
+        """Create and own an official async client with explicit credentials and trust roots.
+
+        Supply exactly one of ``api_key`` or ``basic_auth`` when authentication is required.
+        ``ca_certs`` points to a trusted CA bundle; TLS verification remains enabled by the
+        official client's defaults. ``cursor_secret`` must contain 32–64 secret bytes and must be
+        shared by workers that need to continue each other's cursors.
+        """
         if api_key is not None and basic_auth is not None:
             raise ValueError("Choose either API key or basic authentication.")
         try:
@@ -116,7 +146,13 @@ class ElasticsearchSearchStore:
         )
 
     async def search(self, collection: str, query: SearchQuery) -> SearchPage:
-        """Run a match query with exact filters and stable PIT-backed forward pagination."""
+        """Search a collection and return at most the requested number of hits.
+
+        A point-in-time snapshot and ``search_after`` provide forward pagination. The returned
+        cursor is signed, opaque, query-bound, and valid only while its provider snapshot remains
+        available. Provider timeouts, incomplete shards, malformed responses, and SDK failures are
+        normalized to :class:`SearchOperationError` subclasses; task cancellation propagates.
+        """
         index = validate_collection_name(collection)
         if not isinstance(query, SearchQuery):
             raise TypeError("query must be a SearchQuery.")
@@ -129,7 +165,9 @@ class ElasticsearchSearchStore:
             if query.cursor is None:
                 try:
                     opened = _body(
-                        await self._client.open_point_in_time(index=index, keep_alive=_PIT_TTL)
+                        await self._client.options(
+                            request_timeout=self._request_timeout
+                        ).open_point_in_time(index=index, keep_alive=_PIT_TTL)
                     )
                 except asyncio.CancelledError:
                     raise
@@ -161,6 +199,13 @@ class ElasticsearchSearchStore:
                 )
             except Exception as exc:
                 self._raise_provider_error(exc)
+            if "pit_id" in result:
+                latest_pit = result.get("pit_id")
+                if not isinstance(latest_pit, str) or not latest_pit:
+                    raise SearchOperationError("Elasticsearch returned invalid snapshot data.")
+                # Providers may rotate the PIT ID on every search. Retain the newest one for
+                # either the next signed cursor or final cleanup if response validation fails.
+                pit_id = latest_pit
             if result.get("timed_out") is True:
                 raise SearchOperationError("Elasticsearch search timed out.", retryable=True)
             shard_info = result.get("_shards")
@@ -174,14 +219,13 @@ class ElasticsearchSearchStore:
             page_hits = raw_hits[: query.page_size]
             hits = tuple(self._hit(item) for item in page_hits)
             next_cursor = None
-            new_pit = result.get("pit_id", pit_id)
             if has_more:
                 last_sort = page_hits[-1].get("sort")
-                if not isinstance(last_sort, list) or len(last_sort) != 2:
+                if not _valid_sort_values(last_sort):
                     raise SearchOperationError("Elasticsearch returned invalid pagination data.")
-                if not isinstance(new_pit, str) or not new_pit:
+                if pit_id is None:
                     raise SearchOperationError("Elasticsearch returned invalid snapshot data.")
-                next_cursor = self._encode_cursor(new_pit, last_sort, fingerprint)
+                next_cursor = self._encode_cursor(pit_id, last_sort, fingerprint)
             took_ms = result.get("took", 0)
             if isinstance(took_ms, bool) or not isinstance(took_ms, (int, float)) or took_ms < 0:
                 raise SearchOperationError("Elasticsearch returned invalid timing metadata.")
@@ -195,7 +239,11 @@ class ElasticsearchSearchStore:
                 await self._leave()
 
     async def aclose(self) -> None:
-        """Stop accepting searches, drain active requests, then close the owned client."""
+        """Stop accepting work, wait for active searches, and close the owned client.
+
+        Calling this method again after successful shutdown is safe. If client shutdown fails, a
+        normalized retryable ``SearchOperationError`` is raised and a later call may retry cleanup.
+        """
         async with self._close_lock:
             async with self._condition:
                 if self._closed:
@@ -228,7 +276,9 @@ class ElasticsearchSearchStore:
 
     async def _close_pit(self, pit_id: str) -> None:
         try:
-            await self._client.close_point_in_time(id=pit_id)
+            await self._client.options(request_timeout=self._request_timeout).close_point_in_time(
+                id=pit_id
+            )
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -295,7 +345,12 @@ class ElasticsearchSearchStore:
         return hashlib.sha256(_stable_json(payload)).hexdigest()
 
     def _encode_cursor(self, pit_id: str, sort: list[object], fingerprint: str) -> str:
-        payload = _stable_json({"pit": pit_id, "sort": sort, "query": fingerprint})
+        if not _valid_sort_values(sort):
+            raise SearchOperationError("Elasticsearch returned invalid pagination data.")
+        try:
+            payload = _stable_json({"pit": pit_id, "sort": sort, "query": fingerprint})
+        except (TypeError, ValueError):
+            raise SearchOperationError("Elasticsearch returned invalid pagination data.") from None
         signature = hmac.digest(self._signing_key, payload, "sha256")
         token = base64.urlsafe_b64encode(payload + signature).decode("ascii").rstrip("=")
         if len(token) > _MAX_CURSOR:
@@ -316,7 +371,7 @@ class ElasticsearchSearchStore:
                 or decoded.get("query") != fingerprint
                 or not isinstance(decoded.get("pit"), str)
                 or not isinstance(decoded.get("sort"), list)
-                or len(decoded["sort"]) != 2
+                or not _valid_sort_values(decoded["sort"])
             ):
                 raise ValueError
             return decoded["pit"], decoded["sort"]

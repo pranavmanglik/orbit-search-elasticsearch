@@ -13,13 +13,17 @@ class FakeClient:
     def __init__(self) -> None:
         self.pages: list[dict[str, Any]] = []
         self.requests: list[dict[str, Any]] = []
+        self.request_timeouts: list[float] = []
         self.closed_pits: list[str] = []
         self.closed = False
         self.entered: asyncio.Event | None = None
         self.release: asyncio.Event | None = None
 
-    def options(self, **_kwargs: object) -> FakeClient:
+    def options(self, **kwargs: object) -> FakeClient:
         """Mirror the official client's transport-options view for tests."""
+        timeout = kwargs.get("request_timeout")
+        assert isinstance(timeout, (int, float)) and not isinstance(timeout, bool)
+        self.request_timeouts.append(float(timeout))
         return self
 
     async def open_point_in_time(self, *, index: str, keep_alive: str) -> dict[str, str]:
@@ -71,6 +75,7 @@ async def test_pit_cursor_is_bound_to_query_and_closed_after_final_page() -> Non
     assert client.requests[1]["pit"]["id"] == "snapshot-two"
     assert client.requests[1]["search_after"] == [1.25, 2]
     assert client.closed_pits == ["snapshot-two"]
+    assert client.request_timeouts == [10.0, 10.0, 10.0, 10.0]
 
     with pytest.raises(SearchOperationError, match="cursor is invalid"):
         await store.search(
@@ -78,6 +83,38 @@ async def test_pit_cursor_is_bound_to_query_and_closed_after_final_page() -> Non
         )
     await store.aclose()
     assert client.closed
+
+
+@pytest.mark.asyncio
+async def test_final_page_closes_rotated_pit_id() -> None:
+    client = FakeClient()
+    client.pages.append({"hits": {"hits": [hit(1)]}, "took": 1, "pit_id": "snapshot-rotated"})
+    store = ElasticsearchSearchStore(client, cursor_secret=b"x" * 32)
+
+    result = await store.search("articles", SearchQuery(text="hello", fields=("title",)))
+
+    assert len(result.hits) == 1
+    assert client.closed_pits == ["snapshot-rotated"]
+
+
+@pytest.mark.asyncio
+async def test_non_finite_pagination_sort_is_rejected_and_latest_pit_closed() -> None:
+    client = FakeClient()
+    malformed = hit(1)
+    malformed["sort"] = [1.25, float("nan")]
+    client.pages.append(
+        {
+            "hits": {"hits": [malformed, hit(2)]},
+            "took": 1,
+            "pit_id": "snapshot-rotated",
+        }
+    )
+    store = ElasticsearchSearchStore(client, cursor_secret=b"x" * 32)
+
+    with pytest.raises(SearchOperationError, match="pagination data"):
+        await store.search("articles", SearchQuery(text="hello", fields=("title",), page_size=1))
+
+    assert client.closed_pits == ["snapshot-rotated"]
 
 
 @pytest.mark.asyncio
@@ -110,3 +147,13 @@ async def test_partial_and_malformed_provider_responses_fail_safely() -> None:
     with pytest.raises(SearchOperationError, match="timed out"):
         await store.search("articles", SearchQuery(text="hello", fields=("title",)))
     assert client.closed_pits == ["snapshot-one"]
+
+
+@pytest.mark.parametrize("request_timeout", [True, float("nan"), 0.09, 120.1])
+def test_request_timeout_must_be_finite_and_within_bounds(request_timeout: object) -> None:
+    with pytest.raises(ValueError, match="request_timeout"):
+        ElasticsearchSearchStore(
+            FakeClient(),
+            cursor_secret=b"x" * 32,
+            request_timeout=request_timeout,  # type: ignore[arg-type]
+        )
